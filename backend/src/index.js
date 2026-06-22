@@ -11,6 +11,7 @@ import {
   searchFace,
 } from './rekognition.js';
 import { saveUser, getUserByEmployeeId, saveImage, loadUsers } from './storage.js';
+import { initializeDatabase } from './db.js';
 
 const app = express();
 const upload = multer({
@@ -26,6 +27,41 @@ const upload = multer({
 });
 
 const POSES = ['front', 'left', 'right'];
+
+function parseEmployeeId(employeeId) {
+  const match = /^([A-Za-z-]*?)(\d+)$/.exec(employeeId.trim());
+  if (!match) return null;
+  return {
+    prefix: match[1],
+    number: Number(match[2]),
+    width: match[2].length,
+  };
+}
+
+function formatEmployeeId(prefix, number, width) {
+  return `${prefix}${String(number).padStart(width, '0')}`;
+}
+
+function validateEmployeeIdIncrement(employeeId, existingUsers) {
+  const parsed = parseEmployeeId(employeeId);
+  if (!parsed) return null;
+
+  const samePrefixUsers = existingUsers
+    .map((user) => parseEmployeeId(user.employeeId))
+    .filter(Boolean)
+    .filter((parsedUser) => parsedUser.prefix === parsed.prefix);
+
+  if (samePrefixUsers.length === 0) {
+    return null;
+  }
+
+  const highest = Math.max(...samePrefixUsers.map((user) => user.number));
+  if (parsed.number !== highest + 1) {
+    return `Employee ID must increment to ${formatEmployeeId(parsed.prefix, highest + 1, parsed.width)} for prefix "${parsed.prefix}"`;
+  }
+
+  return null;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -78,12 +114,19 @@ app.post('/api/validate', upload.single('image'), async (req, res) => {
 app.post('/api/enroll', upload.array('images', 3), async (req, res) => {
   try {
     const { fullName, employeeId, email } = req.body;
+    const trimmedEmployeeId = employeeId?.trim();
+    const users = await loadUsers();
 
     const fieldErrors = [];
     if (!fullName?.trim()) fieldErrors.push('Full name is required');
-    if (!employeeId?.trim()) fieldErrors.push('Employee ID is required');
+    if (!trimmedEmployeeId) fieldErrors.push('Employee ID is required');
     if (!email?.trim()) fieldErrors.push('Email is required');
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fieldErrors.push('Invalid email format');
+
+    if (trimmedEmployeeId) {
+      const incrementError = validateEmployeeIdIncrement(trimmedEmployeeId, users);
+      if (incrementError) fieldErrors.push(incrementError);
+    }
 
     if (fieldErrors.length > 0) {
       return res.status(400).json({ success: false, errors: fieldErrors });
@@ -96,11 +139,11 @@ app.post('/api/enroll', upload.array('images', 3), async (req, res) => {
       });
     }
 
-    const existing = getUserByEmployeeId(employeeId.trim());
+    const existing = await getUserByEmployeeId(trimmedEmployeeId);
     if (existing) {
       return res.status(409).json({
         success: false,
-        errors: [`Employee ID "${employeeId}" is already enrolled`],
+        errors: [`Employee ID "${trimmedEmployeeId}" is already enrolled`],
       });
     }
 
@@ -122,18 +165,27 @@ app.post('/api/enroll', upload.array('images', 3), async (req, res) => {
       }
     }
 
+    const duplicateMatch = await searchFace(req.files[0].buffer);
+    if (duplicateMatch && (duplicateMatch.Similarity ?? 0) >= 85) {
+      const existingEmployeeId = (duplicateMatch.Face?.ExternalImageId || '').split('_')[0];
+      return res.status(409).json({
+        success: false,
+        errors: [`A face already exists for Employee ID "${existingEmployeeId || 'unknown'}". Duplicate faces cannot be enrolled.`],
+      });
+    }
+
     const faceIds = [];
-    const externalId = `${employeeId.trim()}_${uuidv4().slice(0, 8)}`;
+    const externalId = `${trimmedEmployeeId}_${uuidv4().slice(0, 8)}`;
 
     for (let i = 0; i < req.files.length; i++) {
       const pose = poses[i];
       const imageId = `${externalId}_${pose}`;
       const record = await indexFace(req.files[i].buffer, imageId);
       faceIds.push(record.Face?.FaceId);
-      saveImage(employeeId.trim(), pose, req.files[i].buffer);
+      saveImage(trimmedEmployeeId, pose, req.files[i].buffer);
     }
 
-    const user = saveUser({
+    const user = await saveUser({
       id: uuidv4(),
       fullName: fullName.trim(),
       employeeId: employeeId.trim(),
@@ -183,7 +235,7 @@ app.post('/api/verify', upload.single('image'), async (req, res) => {
 
     const externalId = match.Face?.ExternalImageId || '';
     const employeeId = externalId.split('_')[0];
-    const user = getUserByEmployeeId(employeeId);
+    const user = await getUserByEmployeeId(employeeId);
     const similarity = match.Similarity ?? 0;
 
     res.json({
@@ -199,15 +251,15 @@ app.post('/api/verify', upload.single('image'), async (req, res) => {
   }
 });
 
-app.get('/api/users', (_req, res) => {
-  const users = loadUsers().map(({ id, fullName, employeeId, email, enrolledAt }) => ({
+app.get('/api/users', async (_req, res) => {
+  const users = await loadUsers();
+  res.json(users.map(({ id, fullName, employeeId, email, enrolledAt }) => ({
     id,
     fullName,
     employeeId,
     email,
     enrolledAt,
-  }));
-  res.json(users);
+  })));
 });
 
 app.use((err, _req, res, _next) => {
@@ -219,11 +271,17 @@ app.use((err, _req, res, _next) => {
 
 const PORT = process.env.PORT || 3001;
 
-initializeRekognition().then(({ mode }) => {
+initializeRekognition().then(async ({ mode }) => {
+  await initializeDatabase();
+  console.log('Database enabled: MySQL/MariaDB storage is active');
+
   app.listen(PORT, () => {
     console.log(`Auxano Facial Recognition API running on http://localhost:${PORT}`);
     if (mode === 'mock') {
       console.log('Running in DEV MODE — add real AWS credentials to backend/.env for live Rekognition');
     }
   });
+}).catch((err) => {
+  console.error('Startup failed:', err.message || err);
+  process.exit(1);
 });

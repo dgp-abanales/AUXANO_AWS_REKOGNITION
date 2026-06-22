@@ -1,10 +1,23 @@
 const API_BASE = '/api';
 
 async function handleResponse(res) {
-  const data = await res.json();
+  const text = await res.text();
+  let data = null;
+
+  if (text.trim()) {
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      throw new Error(`Invalid JSON response from server: ${err.message}`);
+    }
+  }
 
   if (!res.ok) {
-    throw new Error(data.errors?.[0] || data.message || 'Request failed');
+    throw new Error(data?.errors?.[0] || data?.message || `Request failed (${res.status})`);
+  }
+
+  if (data === null) {
+    throw new Error('Empty JSON response from the server');
   }
 
   if (data.success === false) {

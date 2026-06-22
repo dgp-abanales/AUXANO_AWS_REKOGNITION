@@ -282,6 +282,7 @@ input {
   max-width: 640px;
   margin: 0 auto 1rem;
   border: 3px solid var(--blue);
+  transform: scaleX(-1);
 }
 
 .webcam-container video {
